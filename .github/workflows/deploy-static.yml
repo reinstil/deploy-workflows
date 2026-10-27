@@ -13,16 +13,25 @@
 #              Schlüssel: Secret STAGING_SSH_PRIVATE_KEY
 #              Ziel:    ~/<STAGING_PATH>/, Standard public_html
 #              URL:     Variable STAGING_URL (nur für die Anzeige im Run)
+#              Server:  SSH_HOST/SSH_PORT (Input oder Variable), Secret SSH_KNOWN_HOSTS
 #
-#   production Konto:   Variable PROD_SSH_USER      (erst beim Go-live setzen)
+#   production Konto:   Variable PROD_SSH_USER      (beim Go-live, reinstil/projekt-anlage → produktion-einrichten)
 #              Schlüssel: Secret PROD_SSH_PRIVATE_KEY
 #              Ziel:    ~/<PROD_PATH>/; ohne PROD_PATH wird Production übersprungen
+#              URL:     Variable PROD_URL (nur für die Anzeige im Run)
+#              Server:  PROD_SSH_HOST/PROD_SSH_PORT, Secret PROD_KNOWN_HOSTS; fehlen sie, wie Staging
+#              Keine Rückfälle auf die alte Einrichtung (SSH_USER, SSH_PRIVATE_KEY): Production nur mit
+#              eigenen Werten.
 #
-#   Alte Einrichtung (vor den Staging-Konten) funktioniert weiter: Fehlen die obigen Angaben,
-#   gelten ssh_user aus deploy.yml bzw. Variable SSH_USER, Secret SSH_PRIVATE_KEY und
-#   für Staging die Variable STAGING_PATH.
+#   Alte Einrichtung (vor den Staging-Konten) funktioniert für Staging weiter: Fehlen die neuen
+#   Angaben, gelten ssh_user aus deploy.yml bzw. Variable SSH_USER, Secret SSH_PRIVATE_KEY und
+#   die Variable STAGING_PATH.
 #
-#   Für alle: Server SSH_HOST/SSH_PORT (Input oder Variable) und Secret SSH_KNOWN_HOSTS.
+# Schutz für Production:
+#   - Ein Release muss auf einem Commit aus main liegen.
+#   - Jeder Deploy legt im Ziel die Markierung .reinstil-deploy ab. Fehlt sie in einem nicht leeren
+#     Production-Ziel (z. B. alte Website im Kundenkonto), bricht der Deploy ab und listet, was rsync
+#     löschen würde. Freigabe nach Prüfung und Backup: Variable PROD_ERSTER_DEPLOY=ja, danach löschen.
 
 name: Deploy static site
 
@@ -36,7 +45,7 @@ on:
         required: false
         type: string
         default: ""
-      ssh_user:           # nur alte Einrichtung: leer = Variable SSH_USER
+      ssh_user:           # nur alte Einrichtung (Staging): leer = Variable SSH_USER
         required: false
         type: string
         default: ""
@@ -63,15 +72,30 @@ jobs:
     environment: ${{ inputs.environment }}
     concurrency:
       group: deploy-${{ github.repository }}-${{ inputs.environment }}
-      cancel-in-progress: true
+      # Einen laufenden Production-Upload nie abbrechen, sonst bleibt eine halbe Seite stehen
+      cancel-in-progress: ${{ inputs.environment != 'production' }}
     env:
-      SSH_HOST: ${{ inputs.ssh_host || vars.SSH_HOST }}
-      SSH_PORT: ${{ inputs.ssh_port || vars.SSH_PORT || '1988' }}
-      # Konto je Umgebung; neue Variablen haben Vorrang vor der alten Einrichtung
-      SSH_USER: ${{ inputs.environment == 'production' && (vars.PROD_SSH_USER || inputs.ssh_user || vars.SSH_USER) || (vars.STAGING_SSH_USER || inputs.ssh_user || vars.SSH_USER) }}
+      IST_PROD: ${{ inputs.environment == 'production' }}
+      SSH_HOST: ${{ inputs.environment == 'production' && (vars.PROD_SSH_HOST || inputs.ssh_host || vars.SSH_HOST) || (inputs.ssh_host || vars.SSH_HOST) }}
+      SSH_PORT: ${{ inputs.environment == 'production' && (vars.PROD_SSH_PORT || inputs.ssh_port || vars.SSH_PORT || '1988') || (inputs.ssh_port || vars.SSH_PORT || '1988') }}
+      # Konto je Umgebung; für Staging haben neue Variablen Vorrang vor der alten Einrichtung
+      SSH_USER: ${{ inputs.environment == 'production' && vars.PROD_SSH_USER || (vars.STAGING_SSH_USER || inputs.ssh_user || vars.SSH_USER) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          # Production braucht die Historie von main für die Prüfung unten
+          fetch-depth: ${{ inputs.environment == 'production' && 0 || 1 }}
+
+      - name: Release liegt auf main
+        if: inputs.environment == 'production'
+        run: |
+          git fetch --quiet --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::Der Release-Commit $(git rev-parse --short HEAD) liegt nicht auf main. Production nur aus main, Release auf einem Commit von main neu anlegen."
+            exit 1
+          fi
+          echo "Release-Commit $(git rev-parse --short HEAD) liegt auf main."
 
       - name: Projekt erkennen
         id: detect
@@ -99,9 +123,11 @@ jobs:
           LOCK=false
           [ -f package-lock.json ] && LOCK=true
 
-          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
-          echo "out=$OUT"     >> "$GITHUB_OUTPUT"
-          echo "lock=$LOCK"   >> "$GITHUB_OUTPUT"
+          {
+            echo "build=$BUILD"
+            echo "out=$OUT"
+            echo "lock=$LOCK"
+          } >> "$GITHUB_OUTPUT"
           if [ -n "$BUILD" ]; then
             echo "::notice::Build erkannt: '$BUILD' → Upload aus '$OUT/'"
           else
@@ -110,7 +136,7 @@ jobs:
 
       - name: Node einrichten
         if: steps.detect.outputs.build != ''
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: ${{ inputs.node_version }}
           cache: ${{ steps.detect.outputs.lock == 'true' && 'npm' || '' }}
@@ -138,6 +164,7 @@ jobs:
         env:
           ENVIRONMENT: ${{ inputs.environment }}
           PROD_PATH: ${{ vars.PROD_PATH }}
+          PROD_URL: ${{ vars.PROD_URL }}
           STAGING_PATH: ${{ vars.STAGING_PATH }}
           STAGING_SSH_USER: ${{ vars.STAGING_SSH_USER }}
           STAGING_URL: ${{ vars.STAGING_URL }}
@@ -149,7 +176,8 @@ jobs:
               exit 0
             fi
             ZIEL="$PROD_PATH"
-            echo "::notice::Production-Ziel: ${SSH_USER}:~/${ZIEL}"
+            echo "::notice::Production-Ziel: ${SSH_USER}@${SSH_HOST}:~/${ZIEL}"
+            [ -n "$PROD_URL" ] && echo "::notice::Production-URL: ${PROD_URL}"
           else
             if [ -n "$STAGING_PATH" ]; then
               ZIEL="$STAGING_PATH"
@@ -162,36 +190,95 @@ jobs:
             echo "::notice::Staging-Ziel: ${SSH_USER}:~/${ZIEL}"
             [ -n "$STAGING_URL" ] && echo "::notice::Staging-URL: ${STAGING_URL}"
           fi
-          # Schutz vor leeren oder absoluten Pfaden, rsync --delete würde sonst zu viel löschen
+          # Schutz vor leeren, absoluten oder seltsamen Pfaden, rsync --delete würde sonst zu viel löschen
           case "$ZIEL" in
             ""|/*|*..*) echo "::error::Ungültiger Zielpfad '$ZIEL'"; exit 1 ;;
           esac
+          if ! [[ "$ZIEL" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "::error::Zielpfad '$ZIEL' enthält unerlaubte Zeichen (erlaubt: A–Z, a–z, 0–9, . _ / -)"
+            exit 1
+          fi
           echo "path=$ZIEL" >> "$GITHUB_OUTPUT"
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
       - name: Konfiguration prüfen
         if: steps.target.outputs.skip != 'true'
         env:
-          HAS_KEY: ${{ (inputs.environment == 'production' && (secrets.PROD_SSH_PRIVATE_KEY || secrets.SSH_PRIVATE_KEY) || (secrets.STAGING_SSH_PRIVATE_KEY || secrets.SSH_PRIVATE_KEY)) != '' }}
-          HAS_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS != '' }}
+          HAS_KEY: ${{ (inputs.environment == 'production' && secrets.PROD_SSH_PRIVATE_KEY || (secrets.STAGING_SSH_PRIVATE_KEY || secrets.SSH_PRIVATE_KEY)) != '' }}
+          HAS_HOSTS: ${{ (inputs.environment == 'production' && (secrets.PROD_KNOWN_HOSTS || secrets.SSH_KNOWN_HOSTS) || secrets.SSH_KNOWN_HOSTS) != '' }}
         run: |
           ok=true
-          [ -z "$SSH_HOST" ] && echo "::error::SSH_HOST fehlt (deploy.yml oder Variable SSH_HOST)" && ok=false
-          [ -z "$SSH_USER" ] && echo "::error::SSH-Benutzer fehlt (STAGING_SSH_USER / PROD_SSH_USER bzw. ssh_user)" && ok=false
-          [ "$HAS_KEY" != "true" ] && echo "::error::SSH-Schlüssel fehlt (Secret STAGING_SSH_PRIVATE_KEY / PROD_SSH_PRIVATE_KEY bzw. SSH_PRIVATE_KEY)" && ok=false
-          [ "$HAS_HOSTS" != "true" ] && echo "::error::Secret SSH_KNOWN_HOSTS fehlt (Repo oder Org)" && ok=false
+          if [ "$IST_PROD" = true ]; then
+            [ -z "$SSH_USER" ] && echo "::error::Variable PROD_SSH_USER fehlt (reinstil/projekt-anlage → produktion-einrichten)" && ok=false
+            [ "$HAS_KEY" != "true" ] && echo "::error::Secret PROD_SSH_PRIVATE_KEY fehlt (reinstil/projekt-anlage → produktion-einrichten)" && ok=false
+          else
+            [ -z "$SSH_USER" ] && echo "::error::SSH-Benutzer fehlt (STAGING_SSH_USER bzw. ssh_user)" && ok=false
+            [ "$HAS_KEY" != "true" ] && echo "::error::SSH-Schlüssel fehlt (Secret STAGING_SSH_PRIVATE_KEY bzw. SSH_PRIVATE_KEY)" && ok=false
+          fi
+          [ -z "$SSH_HOST" ] && echo "::error::SSH_HOST fehlt (Variable SSH_HOST bzw. PROD_SSH_HOST)" && ok=false
+          [ "$HAS_HOSTS" != "true" ] && echo "::error::Secret SSH_KNOWN_HOSTS (bzw. PROD_KNOWN_HOSTS) fehlt" && ok=false
           [ "$ok" = true ]
 
       - name: SSH einrichten
         if: steps.target.outputs.skip != 'true'
         env:
-          SSH_KEY: ${{ inputs.environment == 'production' && (secrets.PROD_SSH_PRIVATE_KEY || secrets.SSH_PRIVATE_KEY) || (secrets.STAGING_SSH_PRIVATE_KEY || secrets.SSH_PRIVATE_KEY) }}
-          KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+          SSH_KEY: ${{ inputs.environment == 'production' && secrets.PROD_SSH_PRIVATE_KEY || (secrets.STAGING_SSH_PRIVATE_KEY || secrets.SSH_PRIVATE_KEY) }}
+          KNOWN_HOSTS: ${{ inputs.environment == 'production' && (secrets.PROD_KNOWN_HOSTS || secrets.SSH_KNOWN_HOSTS) || secrets.SSH_KNOWN_HOSTS }}
         run: |
           mkdir -p ~/.ssh
           printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          # SSH-Aufruf für rsync (Upload und Probelauf)
+          echo "RSYNC_SSH=ssh -p ${SSH_PORT} -i $HOME/.ssh/id_ed25519" >> "$GITHUB_ENV"
+
+      - name: Production-Ziel prüfen
+        if: steps.target.outputs.skip != 'true' && inputs.environment == 'production'
+        env:
+          OUT: ${{ steps.detect.outputs.out }}
+          ZIEL: ${{ steps.target.outputs.path }}
+          ERSTER_DEPLOY: ${{ vars.PROD_ERSTER_DEPLOY }}
+        run: |
+          # Inhalt des Ziels ohne Dinge, die cPanel selbst anlegt bzw. die der Deploy schützt
+          inhalt=$(ssh -p "$SSH_PORT" -i ~/.ssh/id_ed25519 "${SSH_USER}@${SSH_HOST}" \
+            "if [ -d '$ZIEL' ]; then ls -A '$ZIEL'; fi") || {
+            echo "::error::Anmeldung am Production-Konto ${SSH_USER}@${SSH_HOST} fehlgeschlagen. Ist der öffentliche Schlüssel im cPanel des Kontos importiert und autorisiert?"
+            exit 1
+          }
+          if grep -qx '.reinstil-deploy' <<<"$inhalt"; then
+            echo "Markierung .reinstil-deploy vorhanden – das Ziel stammt aus einem früheren Deploy."
+            exit 0
+          fi
+          fremd=$(grep -vx -e '.htaccess' -e '.well-known' -e 'cgi-bin' <<<"$inhalt" || true)
+          if [ -z "$fremd" ]; then
+            echo "Ziel ist leer (bis auf .htaccess, .well-known, cgi-bin) – erster Deploy ohne Freigabe."
+            exit 0
+          fi
+          # Probelauf: was würde rsync --delete im Ziel löschen?
+          rsync -az --delete --dry-run --itemize-changes \
+            --exclude='.git*' --exclude='node_modules' --exclude='CLAUDE.md' --exclude='.claude' --exclude='README.md' \
+            --filter='P .htaccess' --filter='P .well-known' --filter='P .reinstil-deploy' \
+            -e "$RSYNC_SSH" "${OUT}/" "${SSH_USER}@${SSH_HOST}:${ZIEL}/" > "$RUNNER_TEMP/probelauf.txt"
+          loeschen=$(grep '^\*deleting' "$RUNNER_TEMP/probelauf.txt" | sed 's/^\*deleting *//' || true)
+          anzahl=$(grep -c . <<<"$loeschen" || true)
+          {
+            echo "## Production: fremde Dateien im Ziel \`~/${ZIEL}\`"
+            echo
+            echo "Im Ziel fehlt die Markierung \`.reinstil-deploy\`, es liegen dort Dateien, die nicht aus diesem Repo stammen."
+            echo "Ein Deploy würde **${anzahl} Einträge löschen** (Auszug):"
+            echo
+            echo '```'
+            head -n 200 <<<"$loeschen"
+            echo '```'
+            echo
+            echo "Vorgehen: Backup des Kontos in cPanel, Liste prüfen, dann im Projekt-Repo die Variable \`PROD_ERSTER_DEPLOY=ja\` setzen und den Deploy dieses Releases neu starten. Danach die Variable wieder löschen."
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$ERSTER_DEPLOY" = "ja" ]; then
+            echo "::warning::PROD_ERSTER_DEPLOY=ja – ${anzahl} fremde Einträge im Ziel werden ersetzt. Variable nach dem Deploy löschen."
+            exit 0
+          fi
+          echo "::error::Im Production-Ziel ~/${ZIEL} liegen fremde Dateien (${anzahl} würden gelöscht, Liste in der Zusammenfassung). Nach Prüfung und Backup PROD_ERSTER_DEPLOY=ja setzen und neu starten."
+          exit 1
 
       - name: Upload per rsync
         if: steps.target.outputs.skip != 'true'
@@ -200,7 +287,7 @@ jobs:
           ZIEL: ${{ steps.target.outputs.path }}
         run: |
           # Quellcode-Dateien nie hochladen, falls ohne Build aus dem Repo-Root deployt wird
-          # P = auf dem Server vor dem Löschen schützen (Passwortschutz, SSL-Validierung)
+          # P = auf dem Server vor dem Löschen schützen (Passwortschutz, SSL-Validierung, Markierung)
           rsync -az --delete \
             --exclude='.git*' \
             --exclude='node_modules' \
@@ -209,6 +296,23 @@ jobs:
             --exclude='README.md' \
             --filter='P .htaccess' \
             --filter='P .well-known' \
-            -e "ssh -p ${SSH_PORT} -i ~/.ssh/id_ed25519" \
+            --filter='P .reinstil-deploy' \
+            -e "$RSYNC_SSH" \
             "${OUT}/" \
             "${SSH_USER}@${SSH_HOST}:${ZIEL}/"
+
+      - name: Markierung setzen
+        if: steps.target.outputs.skip != 'true'
+        env:
+          ZIEL: ${{ steps.target.outputs.path }}
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          # Die Datei liegt im Webordner und ist abrufbar, deshalb nur Commit, Umgebung und Zeit
+          printf 'commit=%s\numgebung=%s\nzeit=%s\n' \
+            "$GITHUB_SHA" "$ENVIRONMENT" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            | ssh -p "$SSH_PORT" -i ~/.ssh/id_ed25519 "${SSH_USER}@${SSH_HOST}" "cat > '$ZIEL/.reinstil-deploy'"
+          echo "Markierung ~/${ZIEL}/.reinstil-deploy gesetzt (${GITHUB_SHA:0:7})."
+
+      - name: Schlüssel löschen
+        if: always()
+        run: rm -f ~/.ssh/id_ed25519
