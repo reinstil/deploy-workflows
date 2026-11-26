@@ -3,10 +3,11 @@
 # Die Skripte werden mit yq direkt aus dem Workflow gelesen, damit Test und Workflow nicht auseinanderlaufen.
 # Braucht: bash, yq (mikefarah, auf GitHub-Runnern vorhanden), rsync.
 # Aufruf: bash tests/deploy-static-testen.sh
-# shellcheck disable=SC2015  # "test && ok || fehl" ist hier gewollt, ok endet nie mit Fehler
+# "test && ok || fehl" ist gewollt (ok endet nie mit Fehler); '$(id)' soll nicht expandieren
+# shellcheck disable=SC2015,SC2016
 set -uo pipefail
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 WORKFLOW=.github/workflows/deploy-static.yml
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
