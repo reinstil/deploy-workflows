@@ -77,6 +77,8 @@ ln -s /etc        "$quelle/link-raus"
 ln -s index.html  "$quelle/link-rein"
 
 echo alt        > "$ziel/index.html"
+# Älter als die Quelle, sonst hält rsync gleich große Dateien aus derselben Sekunde für gleich
+touch -d 2020-01-01 "$ziel/index.html"
 echo alt        > "$ziel/alt.html"
 echo SCHUTZ     > "$ziel/.htaccess"
 echo SCHUTZ     > "$ziel/sub/.htaccess"
